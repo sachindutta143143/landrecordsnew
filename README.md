@@ -1,13 +1,18 @@
-# Village People Management V11
+# Village People Management — integrated build
 
-Flask + PostgreSQL app for Railway.
+## Railway
+1. Deploy this folder as the Web service.
+2. In Web service Variables, add a Railway reference named `DATABASE_URL` pointing to the Postgres service's `DATABASE_URL`.
+3. Set `SECRET_KEY` to a long random value.
+4. Deploy. Check `/health/config` then `/health/db`.
+5. Open `/admin`.
 
-## Railway deploy
-1. Keep the existing Postgres service and volume.
-2. In the **Web** service > Variables > Add Reference, select the Postgres service's `DATABASE_URL` and create a Web variable named `DATABASE_URL`.
-3. Redeploy Web. `start.sh` checks the same PostgreSQL URL aliases as `app.py`, then runs `flask --app app init-db` when a DB configuration exists.
-4. Verify `/health/config` and `/health/db` as described in `RAILWAY_FIX.txt`.
+The app creates missing tables on first database-backed request. It does not drop tables or erase existing rows. `create_all()` does not migrate changed columns; back up the database before any schema migration.
 
-`db.create_all()` creates missing tables; it does not delete existing tables or records. No SQLite fallback is used for application records. If no PostgreSQL variable is injected, only the diagnostic/setup page is served.
+## Access
+- `/admin` is intentionally no-login as requested. Anyone who knows the public URL can see/manage all records. This is unsafe for real personal data on a public website.
+- President URLs are token-based and scoped to one village. Generate them from Admin > Temporary links. The raw link is shown once after creation; copy it immediately.
+- President can add, view and export own village records. Admin can add, edit, delete and export all records.
 
-**Security:** Admin no-login mode is enabled at the owner's request. Anyone with the public URL can administer records. Do not use with real personal data unless access is otherwise restricted.
+## Data
+Fields: name, father's name, address, gender. No caste/community collection in this build.
