@@ -1,236 +1,402 @@
-import os, secrets, hashlib, csv, io
+import os
+import secrets
+import hashlib
+import csv
+import io
+import logging
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote_plus
+
 from flask import Flask, render_template, request, redirect, url_for, flash, abort, Response, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
+logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO'))
+logger = logging.getLogger('village_people_management')
+
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True, "pool_recycle": 280}
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+app.config.update(
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    SQLALCHEMY_ENGINE_OPTIONS={'pool_pre_ping': True, 'pool_recycle': 280},
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+)
+
 
 def database_url():
-    for key in ("DATABASE_URL", "RAILWAY_DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL"):
-        value = os.environ.get(key, "").strip()
-        if value:
-            if value.startswith("postgres://"):
-                value = "postgresql://" + value[len("postgres://"):]
-            if value.startswith("postgresql://") and "+psycopg" not in value:
-                value = value.replace("postgresql://", "postgresql+psycopg://", 1)
-            return value
-    # Support Railway's split PG variables without falling back to ephemeral SQLite.
-    host=os.environ.get("PGHOST"); user=os.environ.get("PGUSER")
-    password=os.environ.get("PGPASSWORD"); dbname=os.environ.get("PGDATABASE")
-    if all((host,user,password,dbname)):
-        from urllib.parse import quote_plus
-        port=os.environ.get("PGPORT","5432")
-        return f"postgresql+psycopg://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{dbname}"
+    """Read the database URL passed to THIS web service by Railway."""
+    keys = ('DATABASE_URL', 'RAILWAY_DATABASE_URL', 'POSTGRES_URL', 'POSTGRESQL_URL')
+    for key in keys:
+        value = (os.environ.get(key) or '').strip()
+        if not value:
+            continue
+        if value.startswith('postgres://'):
+            value = 'postgresql://' + value[len('postgres://'):]
+        if value.startswith('postgresql://'):
+            value = 'postgresql+psycopg://' + value[len('postgresql://'):]
+        # Validate syntax before SQLAlchemy is initialized; never expose credentials.
+        try:
+            make_url(value)
+        except Exception:
+            logger.exception('Invalid database URL syntax in environment variable %s', key)
+            return None
+        return value
+
+    # Split PG variables are supported only when all required values exist.
+    host = (os.environ.get('PGHOST') or '').strip()
+    user = (os.environ.get('PGUSER') or '').strip()
+    password = os.environ.get('PGPASSWORD') or ''
+    dbname = (os.environ.get('PGDATABASE') or '').strip()
+    if host and user and password and dbname:
+        port = (os.environ.get('PGPORT') or '5432').strip()
+        return f'postgresql+psycopg://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{dbname}'
     return None
 
-DB_URL = database_url()
-if DB_URL:
-    app.config["SQLALCHEMY_DATABASE_URI"] = DB_URL
-else:
-    # Keep the web process alive so /health/config explains the missing Railway variable.
-    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:////tmp/vpm-diagnostic-only.db"
 
+DB_URL = database_url()
+DATABASE_CONFIGURED = bool(DB_URL)
+# Diagnostic-only SQLite keeps the service able to show a useful setup page.
+# It is NEVER treated as the production database and is NEVER used to save records.
+app.config['SQLALCHEMY_DATABASE_URI'] = DB_URL or 'sqlite:////tmp/vpm-diagnostic-only.db'
 db = SQLAlchemy(app)
 
-def now(): return datetime.now(timezone.utc)
-def token_hash(value): return hashlib.sha256(value.encode()).hexdigest()
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def token_hash(value):
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
 
 class Village(db.Model):
-    id=db.Column(db.Integer, primary_key=True)
-    name=db.Column(db.String(120), unique=True, nullable=False)
-    president_name=db.Column(db.String(120), nullable=False)
-    created_at=db.Column(db.DateTime(timezone=True), default=now, nullable=False)
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), unique=True, nullable=False)
+    president_name = db.Column(db.String(120), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), default=now, nullable=False)
+
 
 class Person(db.Model):
-    id=db.Column(db.Integer, primary_key=True)
-    village_id=db.Column(db.Integer, db.ForeignKey("village.id"), nullable=False, index=True)
-    serial_no=db.Column(db.Integer, nullable=False)
-    name=db.Column(db.String(160), nullable=False)
-    father_name=db.Column(db.String(160), nullable=False)
-    address=db.Column(db.String(300), nullable=False)
-    gender=db.Column(db.String(20), nullable=False)
-    created_at=db.Column(db.DateTime(timezone=True), default=now, nullable=False)
-    village=db.relationship("Village")
-    __table_args__=(db.UniqueConstraint("village_id","serial_no",name="uq_village_serial"),)
+    id = db.Column(db.Integer, primary_key=True)
+    village_id = db.Column(db.Integer, db.ForeignKey('village.id'), nullable=False, index=True)
+    serial_no = db.Column(db.Integer, nullable=False)
+    name = db.Column(db.String(160), nullable=False)
+    father_name = db.Column(db.String(160), nullable=False)
+    address = db.Column(db.String(300), nullable=False)
+    gender = db.Column(db.String(20), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), default=now, nullable=False)
+    village = db.relationship('Village')
+    __table_args__ = (db.UniqueConstraint('village_id', 'serial_no', name='uq_village_serial'),)
+
 
 class AccessLink(db.Model):
-    id=db.Column(db.Integer, primary_key=True)
-    village_id=db.Column(db.Integer, db.ForeignKey("village.id"), nullable=False, index=True)
-    token_hash=db.Column(db.String(64), unique=True, nullable=False)
-    expires_at=db.Column(db.DateTime(timezone=True), nullable=False)
-    revoked=db.Column(db.Boolean, default=False, nullable=False)
-    created_at=db.Column(db.DateTime(timezone=True), default=now, nullable=False)
-    village=db.relationship("Village")
+    id = db.Column(db.Integer, primary_key=True)
+    village_id = db.Column(db.Integer, db.ForeignKey('village.id'), nullable=False, index=True)
+    token_hash = db.Column(db.String(64), unique=True, nullable=False)
+    expires_at = db.Column(db.DateTime(timezone=True), nullable=False)
+    revoked = db.Column(db.Boolean, default=False, nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), default=now, nullable=False)
+    village = db.relationship('Village')
+
+
+_tables_ready = False
+_tables_error = None
+
+
+def ensure_schema():
+    """Create missing tables only. No DROP, TRUNCATE, or automatic column alteration."""
+    global _tables_ready, _tables_error
+    if not DATABASE_CONFIGURED:
+        return False
+    if _tables_ready:
+        return True
+    try:
+        with app.app_context():
+            db.create_all()
+            db.session.execute(text('SELECT 1'))
+            db.session.commit()
+        _tables_ready = True
+        _tables_error = None
+        logger.info('Database connection and table check succeeded')
+        return True
+    except Exception as exc:
+        db.session.rollback()
+        _tables_error = type(exc).__name__
+        logger.exception('Database initialization/table check failed')
+        return False
+
 
 def db_ready():
-    if not DB_URL: return False
+    if not DATABASE_CONFIGURED:
+        return False
+    if not ensure_schema():
+        return False
     try:
-        db.session.execute(text("SELECT 1"))
+        db.session.execute(text('SELECT 1'))
         return True
     except Exception:
         db.session.rollback()
+        logger.exception('Database ping failed during request')
         return False
 
-@app.get("/health")
-def health(): return jsonify(status="ok", database_configured=bool(DB_URL))
-@app.get("/health/config")
+
+@app.get('/health')
+def health():
+    return jsonify(status='ok', database_configured=DATABASE_CONFIGURED)
+
+
+@app.get('/health/config')
 def health_config():
-    keys=("DATABASE_URL","RAILWAY_DATABASE_URL","POSTGRES_URL","POSTGRESQL_URL","PGHOST","PGUSER","PGPASSWORD","PGDATABASE")
-    return jsonify(database_configured=bool(DB_URL), recognized_variable_names_present=[k for k in keys if os.environ.get(k)])
-@app.get("/health/db")
+    keys = ('DATABASE_URL', 'RAILWAY_DATABASE_URL', 'POSTGRES_URL', 'POSTGRESQL_URL', 'PGHOST', 'PGUSER', 'PGPASSWORD', 'PGDATABASE')
+    present = [key for key in keys if (os.environ.get(key) or '').strip()]
+    return jsonify(database_configured=DATABASE_CONFIGURED, recognized_variable_names_present=present,
+                   url_scheme=('postgresql' if DB_URL and DB_URL.startswith('postgresql') else ('other' if DB_URL else None)),
+                   note='Secret values are never returned. A configured variable does not guarantee a successful connection.')
+
+
+@app.get('/health/db')
 def health_db():
-    if not DB_URL: return jsonify(connected=False,error="database_configuration_missing"),503
+    if not DATABASE_CONFIGURED:
+        return jsonify(connected=False, error='database_configuration_missing',
+                       message='This Web service process has no non-empty DATABASE_URL or complete PG* variables.'), 503
+    if not ensure_schema():
+        return jsonify(connected=False, error='database_initialization_failed', detail=_tables_error), 503
     try:
-        db.session.execute(text("SELECT 1"))
-        return jsonify(connected=True,database="postgresql")
-    except Exception as e:
+        db.session.execute(text('SELECT 1'))
+        return jsonify(connected=True, database='postgresql', tables_created_or_present=True)
+    except Exception as exc:
         db.session.rollback()
-        return jsonify(connected=False,error=type(e).__name__,detail=str(e)[:300]),503
+        logger.exception('Health database query failed')
+        return jsonify(connected=False, error=type(exc).__name__, detail=str(exc)[:250]), 503
+
 
 @app.before_request
-def ensure_tables():
-    # Create missing tables only after successful PostgreSQL connection; never drop/alter existing tables.
-    if request.endpoint in ("health","health_config","health_db"): return
-    if DB_URL and not app.config.get("_tables_checked"):
-        try:
-            db.create_all()
-            app.config["_tables_checked"]=True
-        except Exception:
-            db.session.rollback()
+def prepare_database():
+    if request.endpoint in ('health', 'health_config', 'health_db', 'static'):
+        return None
+    if not db_ready():
+        return render_template('setup_error.html'), 503
+    return None
 
-@app.get("/")
-def home(): return redirect(url_for("admin"))
 
-@app.get("/admin")
+@app.get('/')
+def home():
+    return redirect(url_for('admin'))
+
+
+@app.get('/admin')
 def admin():
-    if not db_ready(): return render_template("setup_error.html"), 503
-    villages=Village.query.order_by(Village.name).all()
-    people_q=Person.query.join(Village)
-    q=request.args.get("q","").strip()
-    village_id=request.args.get("village",type=int)
-    gender=request.args.get("gender","")
-    if q: people_q=people_q.filter(db.or_(Person.name.ilike(f"%{q}%"),Person.father_name.ilike(f"%{q}%"),Person.address.ilike(f"%{q}%")))
-    if village_id: people_q=people_q.filter(Person.village_id==village_id)
-    if gender in ("Male","Female","Other"): people_q=people_q.filter(Person.gender==gender)
-    people=people_q.order_by(Village.name,Person.serial_no).limit(2000).all()
-    total=Person.query.count()
-    stats={g:Person.query.filter_by(gender=g).count() for g in ("Male","Female","Other")}
-    summaries=[]
-    for v in villages:
-        summaries.append({"village":v,"total":Person.query.filter_by(village_id=v.id).count(),
-          "male":Person.query.filter_by(village_id=v.id,gender="Male").count(),
-          "female":Person.query.filter_by(village_id=v.id,gender="Female").count(),
-          "other":Person.query.filter_by(village_id=v.id,gender="Other").count()})
-    links=AccessLink.query.order_by(AccessLink.created_at.desc()).all()
-    return render_template("admin.html",villages=villages,people=people,total=total,stats=stats,summaries=summaries,links=links,q=q,selected=village_id,gender=gender)
+    villages = Village.query.order_by(Village.name).all()
+    q = request.args.get('q', '').strip()
+    village_id = request.args.get('village', type=int)
+    gender = request.args.get('gender', '')
+    people_q = Person.query.join(Village)
+    if q:
+        pattern = f'%{q}%'
+        people_q = people_q.filter(db.or_(Person.name.ilike(pattern), Person.father_name.ilike(pattern), Person.address.ilike(pattern)))
+    if village_id:
+        people_q = people_q.filter(Person.village_id == village_id)
+    if gender in ('Male', 'Female', 'Other'):
+        people_q = people_q.filter(Person.gender == gender)
+    people = people_q.order_by(Village.name, Person.serial_no).limit(2000).all()
+    total = db.session.query(func.count(Person.id)).scalar() or 0
+    grouped = db.session.query(Person.village_id, Person.gender, func.count(Person.id)).group_by(Person.village_id, Person.gender).all()
+    counts = {}
+    for vid, gen, count in grouped:
+        counts.setdefault(vid, {'total': 0, 'male': 0, 'female': 0, 'other': 0})
+        counts[vid]['total'] += count
+        counts[vid][{'Male': 'male', 'Female': 'female', 'Other': 'other'}.get(gen, 'other')] += count
+    summaries = [{'village': v, **counts.get(v.id, {'total': 0, 'male': 0, 'female': 0, 'other': 0})} for v in villages]
+    stats = {g: sum(c for _, gen, c in grouped if gen == g) for g in ('Male', 'Female', 'Other')}
+    links = AccessLink.query.order_by(AccessLink.created_at.desc()).all()
+    return render_template('admin.html', villages=villages, people=people, total=total, stats=stats,
+                           summaries=summaries, links=links, q=q, selected=village_id, gender=gender)
 
-@app.post("/admin/villages")
+
+@app.post('/admin/villages')
 def add_village():
-    if not db_ready(): abort(503)
-    name=request.form.get("name","").strip(); president=request.form.get("president_name","").strip()
-    if not name or not president: flash("Village aur President name required hai.","error")
-    elif Village.query.filter(func.lower(Village.name)==name.lower()).first(): flash("Village already exists.","error")
+    name = request.form.get('name', '').strip()
+    president = request.form.get('president_name', '').strip()
+    if not name or not president:
+        flash('Village aur President name required hai.', 'error')
+    elif Village.query.filter(func.lower(Village.name) == name.lower()).first():
+        flash('Village already exists.', 'error')
     else:
-        db.session.add(Village(name=name,president_name=president)); db.session.commit(); flash("Village added.","success")
-    return redirect(url_for("admin")+"#villages")
+        db.session.add(Village(name=name, president_name=president))
+        db.session.commit()
+        flash('Village added.', 'success')
+    return redirect(url_for('admin') + '#villages')
 
-@app.post("/admin/villages/<int:vid>/edit")
+
+@app.post('/admin/villages/<int:vid>/edit')
 def edit_village(vid):
-    v=db.get_or_404(Village,vid); v.name=request.form.get("name",v.name).strip(); v.president_name=request.form.get("president_name",v.president_name).strip()
-    db.session.commit(); flash("Village updated.","success"); return redirect(url_for("admin")+"#villages")
+    v = db.get_or_404(Village, vid)
+    name = request.form.get('name', v.name).strip()
+    president = request.form.get('president_name', v.president_name).strip()
+    if name and president:
+        v.name, v.president_name = name, president
+        db.session.commit()
+        flash('Village updated.', 'success')
+    else:
+        flash('Village and president name are required.', 'error')
+    return redirect(url_for('admin') + '#villages')
 
-@app.post("/admin/people")
+
+@app.post('/admin/people')
 def add_person_admin():
-    return save_person(None)
+    return save_person()
 
-@app.post("/p/<token>/people")
+
+@app.post('/p/<token>/people')
 def add_person_president(token):
-    link=get_link(token)
-    if not link: abort(404)
-    return save_person(link.village_id, token)
+    link = get_link(token)
+    if not link:
+        abort(404)
+    return save_person(locked_village_id=link.village_id, token=token)
+
 
 def save_person(locked_village_id=None, token=None):
-    vid=locked_village_id or request.form.get("village_id",type=int)
-    v=db.get_or_404(Village,vid)
-    name=request.form.get("name","").strip(); father=request.form.get("father_name","").strip()
-    address=request.form.get("address","").strip(); gender=request.form.get("gender","")
-    if not all((name,father,address)) or gender not in ("Male","Female","Other"):
-        flash("Please complete all required fields.","error")
-        return redirect(url_for("president",token=token) if token else url_for("admin")+"#people")
+    vid = locked_village_id if locked_village_id is not None else request.form.get('village_id', type=int)
+    if not vid:
+        flash('Please choose a village.', 'error')
+        return redirect(url_for('president', token=token) if token else url_for('admin') + '#people')
+    v = db.get_or_404(Village, vid)
+    name = request.form.get('name', '').strip()
+    father = request.form.get('father_name', '').strip()
+    address = request.form.get('address', '').strip()
+    gender = request.form.get('gender', '')
+    if not all((name, father, address)) or gender not in ('Male', 'Female', 'Other'):
+        flash('Please complete all required fields.', 'error')
+        return redirect(url_for('president', token=token) if token else url_for('admin') + '#people')
     try:
-        # Retry-safe serial assignment protected by unique constraint; row lock on village for PostgreSQL.
-        if DB_URL: db.session.execute(text("SELECT id FROM village WHERE id=:id FOR UPDATE"),{"id":vid})
-        last=db.session.query(func.max(Person.serial_no)).filter_by(village_id=vid).scalar() or 0
-        p=Person(village_id=vid,serial_no=last+1,name=name,father_name=father,address=address,gender=gender)
-        db.session.add(p); db.session.commit()
-        flash(f"Record saved. Serial No. {p.serial_no}","success")
+        # PostgreSQL row lock serializes serial-number assignment per village.
+        db.session.execute(text('SELECT id FROM village WHERE id=:id FOR UPDATE'), {'id': vid})
+        last = db.session.query(func.max(Person.serial_no)).filter_by(village_id=vid).scalar() or 0
+        person = Person(village_id=vid, serial_no=last + 1, name=name, father_name=father, address=address, gender=gender)
+        db.session.add(person)
+        db.session.commit()
+        flash(f'Record saved. Serial No. {person.serial_no}', 'success')
     except Exception:
-        db.session.rollback(); flash("Record save nahi hua. Please retry.","error")
-    return redirect(url_for("president",token=token) if token else url_for("admin")+"#people")
+        db.session.rollback()
+        logger.exception('Could not save person record')
+        flash('Record save nahi hua. Please retry.', 'error')
+    return redirect(url_for('president', token=token) if token else url_for('admin') + '#people')
 
-@app.post("/admin/people/<int:pid>/edit")
+
+@app.post('/admin/people/<int:pid>/edit')
 def edit_person(pid):
-    p=db.get_or_404(Person,pid)
-    p.name=request.form.get("name",p.name).strip(); p.father_name=request.form.get("father_name",p.father_name).strip()
-    p.address=request.form.get("address",p.address).strip(); p.gender=request.form.get("gender",p.gender)
-    db.session.commit(); flash("Record updated.","success"); return redirect(url_for("admin")+"#people")
+    person = db.get_or_404(Person, pid)
+    person.name = request.form.get('name', person.name).strip()
+    person.father_name = request.form.get('father_name', person.father_name).strip()
+    person.address = request.form.get('address', person.address).strip()
+    gender = request.form.get('gender', person.gender)
+    if gender in ('Male', 'Female', 'Other'):
+        person.gender = gender
+    db.session.commit()
+    flash('Record updated.', 'success')
+    return redirect(url_for('admin') + '#people')
 
-@app.post("/admin/people/<int:pid>/delete")
+
+@app.post('/admin/people/<int:pid>/delete')
 def delete_person(pid):
-    p=db.get_or_404(Person,pid); db.session.delete(p); db.session.commit(); flash("Record deleted.","success"); return redirect(url_for("admin")+"#people")
+    person = db.get_or_404(Person, pid)
+    db.session.delete(person)
+    db.session.commit()
+    flash('Record deleted.', 'success')
+    return redirect(url_for('admin') + '#people')
 
-@app.post("/admin/links/<int:vid>")
+
+@app.post('/admin/links/<int:vid>')
 def create_link(vid):
-    v=db.get_or_404(Village,vid); raw=secrets.token_urlsafe(32)
-    link=AccessLink(village_id=vid,token_hash=token_hash(raw),expires_at=now()+timedelta(days=max(1,min(request.form.get("days",7,type=int),30))))
-    db.session.add(link); db.session.commit()
-    flash("President link (copy now): "+url_for("president",token=raw,_external=True),"success")
-    return redirect(url_for("admin")+"#links")
+    village = db.get_or_404(Village, vid)
+    raw = secrets.token_urlsafe(32)
+    days = request.form.get('days', 7, type=int) or 7
+    days = max(1, min(days, 30))
+    link = AccessLink(village_id=village.id, token_hash=token_hash(raw), expires_at=now() + timedelta(days=days))
+    db.session.add(link)
+    db.session.commit()
+    flash('President link (copy now): ' + url_for('president', token=raw, _external=True), 'success')
+    return redirect(url_for('admin') + '#links')
 
-@app.post("/admin/links/<int:lid>/revoke")
+
+@app.post('/admin/links/<int:lid>/revoke')
 def revoke_link(lid):
-    link=db.get_or_404(AccessLink,lid); link.revoked=True; db.session.commit(); return redirect(url_for("admin")+"#links")
+    link = db.get_or_404(AccessLink, lid)
+    link.revoked = True
+    db.session.commit()
+    flash('President link revoked.', 'success')
+    return redirect(url_for('admin') + '#links')
+
 
 def get_link(token):
-    link=AccessLink.query.filter_by(token_hash=token_hash(token)).first()
-    if not link or link.revoked or link.expires_at<=now(): return None
+    link = AccessLink.query.filter_by(token_hash=token_hash(token)).first()
+    if not link or link.revoked:
+        return None
+    expiry = link.expires_at
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if expiry <= now():
+        return None
     return link
 
-@app.route("/p/<token>",methods=["GET"])
+
+@app.get('/p/<token>')
 def president(token):
-    if not db_ready(): return render_template("setup_error.html"),503
-    link=get_link(token)
-    if not link: abort(404)
-    v=link.village
-    q=request.args.get("q","").strip(); gender=request.args.get("gender","")
-    query=Person.query.filter_by(village_id=v.id)
-    if q: query=query.filter(db.or_(Person.name.ilike(f"%{q}%"),Person.father_name.ilike(f"%{q}%"),Person.address.ilike(f"%{q}%")))
-    if gender in ("Male","Female","Other"): query=query.filter_by(gender=gender)
-    people=query.order_by(Person.serial_no).all()
-    stats={g:Person.query.filter_by(village_id=v.id,gender=g).count() for g in ("Male","Female","Other")}
-    return render_template("president_connected.html",village=v,people=people,stats=stats,link=link,q=q,gender=gender)
+    link = get_link(token)
+    if not link:
+        abort(404)
+    village = link.village
+    q = request.args.get('q', '').strip()
+    gender = request.args.get('gender', '')
+    query = Person.query.filter_by(village_id=village.id)
+    if q:
+        pattern = f'%{q}%'
+        query = query.filter(db.or_(Person.name.ilike(pattern), Person.father_name.ilike(pattern), Person.address.ilike(pattern)))
+    if gender in ('Male', 'Female', 'Other'):
+        query = query.filter_by(gender=gender)
+    people = query.order_by(Person.serial_no).all()
+    stats = {g: Person.query.filter_by(village_id=village.id, gender=g).count() for g in ('Male', 'Female', 'Other')}
+    return render_template('president_connected.html', village=village, people=people, stats=stats, link=link, q=q, gender=gender)
 
-@app.get("/admin/export.csv")
+
+def csv_response(rows, filename):
+    output = io.StringIO()
+    writer = csv.writer(output)
+    for row in rows:
+        writer.writerow(row)
+    return Response('\ufeff' + output.getvalue(), mimetype='text/csv; charset=utf-8',
+                    headers={'Content-Disposition': f'attachment; filename={filename}'})
+
+
+@app.get('/admin/export.csv')
 def export_admin():
-    out=io.StringIO(); w=csv.writer(out); w.writerow(["Village","Serial No","Name","Father Name","Address","Gender"])
-    for p in Person.query.join(Village).order_by(Village.name,Person.serial_no).all():
-        w.writerow([p.village.name,p.serial_no,p.name,p.father_name,p.address,p.gender])
-    return Response("\ufeff"+out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":"attachment; filename=all_village_people.csv"})
+    rows = [['Village', 'Serial No', 'Name', 'Father Name', 'Address', 'Gender']]
+    for person in Person.query.join(Village).order_by(Village.name, Person.serial_no).all():
+        rows.append([person.village.name, person.serial_no, person.name, person.father_name, person.address, person.gender])
+    return csv_response(rows, 'all_village_people.csv')
 
-@app.get("/p/<token>/export.csv")
+
+@app.get('/p/<token>/export.csv')
 def export_president(token):
-    link=get_link(token)
-    if not link: abort(404)
-    out=io.StringIO(); w=csv.writer(out); w.writerow(["Serial No","Name","Father Name","Address","Gender"])
-    for p in Person.query.filter_by(village_id=link.village_id).order_by(Person.serial_no).all():
-        w.writerow([p.serial_no,p.name,p.father_name,p.address,p.gender])
-    return Response("\ufeff"+out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":"attachment; filename=village_people.csv"})
+    link = get_link(token)
+    if not link:
+        abort(404)
+    rows = [['Serial No', 'Name', 'Father Name', 'Address', 'Gender']]
+    for person in Person.query.filter_by(village_id=link.village_id).order_by(Person.serial_no).all():
+        rows.append([person.serial_no, person.name, person.father_name, person.address, person.gender])
+    return csv_response(rows, 'village_people.csv')
 
-if __name__=="__main__": app.run(host="0.0.0.0",port=int(os.environ.get("PORT",8080)))
+
+@app.errorhandler(500)
+def internal_error(error):
+    db.session.rollback()
+    logger.exception('Unhandled application error: %s', error)
+    return ('Application error. Check Railway Deploy Logs for the detailed traceback.', 500)
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
