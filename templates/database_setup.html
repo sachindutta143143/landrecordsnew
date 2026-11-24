@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card" style="max-width:760px;margin:48px auto;padding:28px">
+  <h1>Database connection setup required</h1>
+  <p>The application is running, but it cannot access the shared PostgreSQL database yet.</p>
+  <p><strong>{{ message }}</strong></p>
+  <ol>
+    <li>Open this Railway project and select the Flask Web service.</li>
+    <li>Open Variables and choose Add Reference.</li>
+    <li>Select the PostgreSQL service and its <code>DATABASE_URL</code> variable.</li>
+    <li>Save and redeploy the Web service.</li>
+  </ol>
+  <p>Do not create a separate SQLite database. Existing PostgreSQL records are not modified by this setup page.</p>
+  <p><a href="/health/db">Check database connection</a></p>
+</div>
+{% endblock %}

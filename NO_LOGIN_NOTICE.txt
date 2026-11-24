@@ -1,0 +1,4 @@
+NO-LOGIN BUILD
+Admin routes do not require username/password. The site root opens the Admin Dashboard.
+WARNING: Anyone with access to the public website URL can access all records and admin actions.
+Keep PostgreSQL DATABASE_URL configured through Railway Add Reference. Do not delete the existing database/volume.

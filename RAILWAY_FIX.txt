@@ -1,0 +1,22 @@
+VILLAGE PEOPLE MANAGEMENT V11 - RAILWAY DATABASE STARTUP FIX
+
+What was corrected after inspecting V10:
+- railway.json and Procfile previously checked only DATABASE_URL, while app.py accepted several URL aliases and split PG* variables.
+- Both startup paths now use the same start.sh script.
+- start.sh checks the same URL aliases and split PostgreSQL variables before running init-db.
+- If no database variables are injected, the app stays available only for diagnostics; it does not store records in SQLite.
+- init-db uses SQLAlchemy create_all(), which creates missing tables but does not drop existing tables or records.
+
+REQUIRED RAILWAY ACTION:
+The application cannot discover another Railway service's environment by code. In the WEB service's Variables, add a Reference from the Postgres service's DATABASE_URL and map it to the variable name DATABASE_URL. Make sure both services are in the same Railway project and same environment (e.g. production), then redeploy Web.
+
+VERIFY:
+1. /health/config must show database_configured=true and DATABASE_URL in recognized_variable_names_present.
+2. /health/db must show {"status":"ok","database":"connected"}.
+3. Then inspect Postgres > Database > Data. The app's init-db command should create village, person, access_link, admin, and audit_log tables if absent.
+
+IMPORTANT:
+- Do not delete the Postgres service or postgres-volume.
+- Do not use Create Table manually.
+- This ZIP cannot inject Railway variables or prove a live Railway connection. Live verification is still required.
+- No-login Admin mode is enabled. Anyone who can access the public app URL may manage records; do not use with real personal data on an untrusted public URL.

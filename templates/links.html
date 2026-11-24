@@ -1,0 +1,6 @@
+{% extends 'base.html' %}{% block content %}<section class="panel"><div class="topline"><div><h1>{{ village.name }} — Links</h1><div class="muted">Links are shown only once when generated. Create a new one if needed.</div></div><a class="btn" href="{{ url_for('dashboard') }}">← Dashboard</a></div>
+<div class="table-wrap"><table><thead><tr><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr></thead><tbody>
+{% for link in village.links|sort(attribute='created_at',reverse=true) %}<tr><td>{{ link.created_at.strftime('%d %b %Y %H:%M UTC') }}</td><td>{{ link.expires_at.strftime('%d %b %Y %H:%M UTC') }}</td>
+<td>{% if link.revoked %}Revoked{% elif link.expires_at.replace(tzinfo=None)<=now.replace(tzinfo=None) %}Expired{% else %}Active{% endif %}</td>
+<td>{% if not link.revoked and link.expires_at.replace(tzinfo=None)>now.replace(tzinfo=None) %}<form method="post" action="{{ url_for('revoke_link',link_id=link.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn danger small">Revoke</button></form>{% endif %}</td></tr>
+{% else %}<tr><td colspan="4">No links generated yet.</td></tr>{% endfor %}</tbody></table></div></section>{% endblock %}
